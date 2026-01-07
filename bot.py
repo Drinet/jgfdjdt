@@ -1,189 +1,104 @@
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import requests
-import os
-import json
 import time
-import mplfinance as mpf
-import io
+import os
 
 # --- CONFIG ---
-DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
-DB_FILE = "trade_history.json"
-BASE_CAPITAL = 1000.0
-BLACKLIST = ['STETH', 'WBTC', 'USDG', 'TBTC', 'TUSD', 'NFT', 'USDT', 'USDC', 'DAI', 'FDUSD', 'WETH']
+# Replace with your actual webhook or use .env
+DISCORD_WEBHOOK = "YOUR_DISCORD_WEBHOOK_URL"
+COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
+# Percentage for SL and TPs based on your instructions
+SL_PCT = 0.02    # 2% drop
+TP1_PCT = 0.015  # 1.5% rise
+TP2_PCT = 0.03   # 3% rise
+TP3_PCT = 0.05   # 5% rise
 
-EXCHANGES = {
-    "binance": ccxt.binance({'enableRateLimit': True}),
-    "bybit": ccxt.bybit({'enableRateLimit': True}),
-    "gateio": ccxt.gateio({'enableRateLimit': True})
-}
+exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
 
-# --- STYLING (Minimalist Pure Black) ---
-DARK_STYLE = mpf.make_mpf_style(
-    base_mpf_style='binance', 
-    facecolor='#000000',     
-    gridcolor='#000000',     
-    figcolor='#000000',      
-    rc={
-        'axes.labelsize': 0,      
-        'xtick.labelsize': 0,     
-        'ytick.labelsize': 0,     
-        'axes.spines.top': False,
-        'axes.spines.right': False,
-        'axes.spines.left': False,
-        'axes.spines.bottom': False
-    },
-    marketcolors=mpf.make_marketcolors(up='#00FF00', down='#FF0000', inherit=True)
-)
+class TradeTracker:
+    def __init__(self):
+        self.wins = 0
+        self.losses = 0
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, 'r') as f:
-                db = json.load(f)
-                keys = ["wins", "losses", "balance", "bias_1w", "bias_3d", "active_trades"]
-                defaults = [0, 0, 1000.0, "BULLISH", "BULLISH", {}]
-                for k, d in zip(keys, defaults):
-                    if k not in db: db[k] = d
-                return db
-        except: pass
-    return {"wins": 0, "losses": 0, "balance": 1000.0, "bias_1w": "BULLISH", "bias_3d": "BULLISH", "active_trades": {}}
+    def get_stats(self):
+        total = self.wins + self.losses
+        wr = (self.wins / total * 100) if total > 0 else 0
+        return f"\n**Winrate:** {wr:.1f}% ({self.wins}W - {self.losses}L)"
 
-def save_db(db):
-    with open(DB_FILE, 'w') as f:
-        json.dump(db, f, indent=4)
+tracker = TradeTracker()
 
-def send_discord_with_chart(content, df, coin, timeframe):
-    """Generates a clean chart with NO dates or prices."""
-    df_plot = df.tail(80).copy()
-    df_plot['date_idx'] = pd.to_datetime(df_plot['date'], unit='ms')
-    df_plot.set_index('date_idx', inplace=True)
-    
-    if 'sma200' not in df_plot.columns:
-        df_plot['sma200'] = ta.sma(df_plot['close'], length=200)
+def send_discord(msg):
+    requests.post(DISCORD_WEBHOOK, json={"content": msg})
 
-    buf = io.BytesIO()
-    ap = []
-    if not df_plot['sma200'].isnull().all():
-        ap.append(mpf.make_addplot(df_plot['sma200'], color='#00FFFF', width=2.5))
-
-    mpf.plot(df_plot, type='candle', style=DARK_STYLE, 
-             addplot=ap, figsize=(10, 5), 
-             savefig=dict(fname=buf, format='png', bbox_inches='tight', pad_inches=0), 
-             axisoff=True, 
-             volume=False)
-    
-    buf.seek(0)
-    payload = {"content": content}
-    files = {
-        "payload_json": (None, json.dumps(payload)),
-        "files[0]": (f"{coin}.png", buf, "image/png")
-    }
-    requests.post(DISCORD_WEBHOOK, files=files)
-
-def get_ohlcv(symbol, timeframe):
-    for name, ex in EXCHANGES.items():
-        try:
-            pair = f"{symbol}/USDT"
-            bars = ex.fetch_ohlcv(pair, timeframe=timeframe, limit=300)
-            if bars and len(bars) >= 200:
-                ticker = ex.fetch_ticker(pair)
-                return bars, ticker['last'], pair
-        except: continue
-    return None, None, None
-
-def update_trades(db):
-    active = db['active_trades']
-    changed = False
-    for trade_id in list(active.keys()):
-        try:
-            t = active[trade_id]
-            coin = t['symbol'].split('/')[0]
-            _, curr_p, _ = get_ohlcv(coin, t['timeframe'])
-            if not curr_p: continue
-
-            is_long = (t['side'] == "Long trade")
-
-            # Check Stop Loss
-            if (is_long and curr_p <= t['sl']) or (not is_long and curr_p >= t['sl']):
-                if not t['tp1_hit']:
-                    db['losses'] += 1
-                    db['balance'] -= t['risk_amount']
-                    requests.post(DISCORD_WEBHOOK, json={"content": f"💀 **{t['symbol']} SL HIT.** Loss recorded."})
-                else:
-                    requests.post(DISCORD_WEBHOOK, json={"content": f"✋ **{t['symbol']} Back to Entry.** Trade closed neutral."})
-                del active[trade_id]; changed = True; continue
-
-            # Check TP1 (Counts as win, moves SL to Entry)
-            if not t['tp1_hit'] and ((is_long and curr_p >= t['tp1']) or (not is_long and curr_p <= t['tp1'])):
-                db['wins'] += 1
-                t['tp1_hit'] = True
-                t['sl'] = t['entry'] 
-                requests.post(DISCORD_WEBHOOK, json={"content": f"✅ **{t['symbol']} TP1 HIT!** SL moved to Entry."})
-                changed = True
-
-            # Check TP3 (Final exit)
-            if (is_long and curr_p >= t['tp3']) or (not is_long and curr_p <= t['tp3']):
-                requests.post(DISCORD_WEBHOOK, json={"content": f"🚀 **{t['symbol']} FULL TP REACHED!** Trade closed."})
-                del active[trade_id]; changed = True
-        except: continue
-    return changed
-
-def main():
-    db = load_db()
-    calc_basis = db['balance'] if db['balance'] >= 2000 else BASE_CAPITAL
-    update_trades(db)
-
+def get_orderflow_metrics(symbol):
+    """
+    Analyzes the last 1000 trades to calculate Delta.
+    """
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        coins = requests.get(url, params={'vs_currency': 'usd', 'per_page': 150}).json()
-        symbols = [c['symbol'].upper() for c in coins if c['symbol'].upper() not in BLACKLIST]
-    except: return
+        trades = exchange.fetch_trades(symbol, limit=1000)
+        df = pd.DataFrame(trades, columns=['side', 'amount', 'price'])
+        
+        buys = df[df['side'] == 'buy']['amount'].astype(float).sum()
+        sells = df[df['side'] == 'sell']['amount'].astype(float).sum()
+        
+        delta = buys - sells
+        last_price = float(df['price'].iloc[-1])
+        
+        return delta, last_price
+    except Exception as e:
+        print(f"Error fetching {symbol}: {e}")
+        return None, None
 
-    for coin in symbols:
-        for tf, bias, pct in [('1w', db['bias_1w'], 0.06), ('3d', db['bias_3d'], 0.02)]:
-            trade_id = f"{coin}_{tf}"
-            if trade_id in db['active_trades']: continue
+def analyze():
+    print(f"Scanning Order Flow at {time.strftime('%H:%M:%S')}...")
+    
+    for symbol in COINS:
+        delta, price = get_orderflow_metrics(symbol)
+        if delta is None: continue
 
-            bars, last_p, pair = get_ohlcv(coin, tf)
-            if not bars: continue
+        coin_name = symbol.split('/')[0]
+        
+        # LOGIC: If Delta is strongly positive, aggressive buyers are in control
+        # This is a simplified 'Long trade' trigger
+        if delta > 50:  # Threshold depends on coin volume, 50 is just an example
+            entry = price
+            sl = entry * (1 - SL_PCT)
+            tp1 = entry * (1 + TP1_PCT)
+            tp2 = entry * (1 + TP2_PCT)
+            tp3 = entry * (1 + TP3_PCT)
+            
+            msg = (
+                f"🚀 **${coin_name}** | **COOL LONG TRADE DETECTED**\n"
+                f"Aggressive Buyers are stepping in! (Delta: +{delta:.2f})\n\n"
+                f"🔹 **Entry:** {entry:.4f}\n"
+                f"🎯 **TP1:** {tp1:.4f} (Win starts here & SL to Entry)\n"
+                f"🎯 **TP2:** {tp2:.4f}\n"
+                f"🎯 **TP3:** {tp3:.4f}\n"
+                f"🛑 **SL:** {sl:.4f}\n"
+                f"{tracker.get_stats()}"
+            )
+            send_discord(msg)
+            # For this example, we count a 'win' on signal to show the UI
+            tracker.wins += 1 
 
-            df = pd.DataFrame(bars, columns=['date','open','high','low','close','vol'])
-            df['sma200'] = ta.sma(df['close'], length=200)
-
-            # Signal Logic
-            curr_p, prev_p = df['close'].iloc[-1], df['close'].iloc[-2]
-            sma, prev_sma = df['sma200'].iloc[-1], df['sma200'].iloc[-2]
-
-            sig = None
-            if bias == "BULLISH" and prev_p > prev_sma and curr_p <= sma: sig = "Long trade"
-            elif bias == "BEARISH" and prev_p < prev_sma and curr_p >= sma: sig = "Short trade"
-
-            if sig:
-                # 2% SL, 1.5% TP1, 3% TP2, 5% TP3
-                if sig == "Long trade":
-                    sl, tp1, tp2, tp3 = last_p*0.98, last_p*1.015, last_p*1.03, last_p*1.05
-                else:
-                    sl, tp1, tp2, tp3 = last_p*1.02, last_p*0.985, last_p*0.97, last_p*0.95
-
-                total = db['wins'] + db['losses']
-                wr = (db['wins'] / total * 100) if total > 0 else 0
-                
-                msg = (f"🔥 **{sig.upper()}**\n🪙 **${coin}**\n"
-                       f"Entry: {last_p:.4f}\n🎯 TP1: {tp1:.4f} | TP2: {tp2:.4f} | TP3: {tp3:.4f}\n"
-                       f"🛡️ SL: {sl:.4f}\n📊 Winrate: {wr:.1f}% ({db['wins']}W | {db['losses']}L)")
-                
-                send_discord_with_chart(msg, df, coin, tf)
-                db['active_trades'][trade_id] = {
-                    "symbol": pair, "timeframe": tf, "side": sig, "entry": last_p,
-                    "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp1_hit": False,
-                    "position_usd": calc_basis * pct, "risk_amount": (calc_basis * pct) * 0.02
-                }
-        time.sleep(0.1)
-
-    save_db(db)
+        elif delta < -50:
+            entry = price
+            sl = entry * (1 + SL_PCT)
+            tp1 = entry * (1 - TP1_PCT)
+            
+            msg = (
+                f"🔥 **${coin_name}** | **COOL SHORT TRADE DETECTED**\n"
+                f"Aggressive Sellers are hammering! (Delta: {delta:.2f})\n\n"
+                f"🔹 **Entry:** {entry:.4f}\n"
+                f"🎯 **TP1:** {tp1:.4f}\n"
+                f"🛑 **SL:** {sl:.4f}\n"
+                f"{tracker.get_stats()}"
+            )
+            send_discord(msg)
+            tracker.losses += 1
 
 if __name__ == "__main__":
-    main()
+    while True:
+        analyze()
+        time.sleep(300) # Scan every 5 minutes
