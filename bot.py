@@ -7,28 +7,28 @@ import sys
 # --- CONFIG ---
 DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
 
-# Initialize Exchange with a 10s timeout to prevent hanging
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'timeout': 10000, 
-    'options': {'defaultType': 'future'}
-})
+# Exchanges that usually work on GitHub Actions (No US blocking for public data)
+EXCHANGE_LIST = ['kraken', 'kucoin', 'okx', 'bitfinex', 'gateio']
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 
 def send_discord(msg):
-    if not DISCORD_WEBHOOK:
-        return
+    if not DISCORD_WEBHOOK: return
     try:
-        # Added timeout=10 so it doesn't hang forever if Discord is slow
         requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
-    except Exception as e:
-        print(f"Discord Error: {e}")
+    except:
+        pass
 
-def track_order_flow(symbol):
+def get_order_flow(exchange_id, symbol):
+    """Fetches and calculates market aggression for a specific exchange."""
     try:
-        # Fetch only the last 500 trades to keep it fast
-        trades = exchange.fetch_trades(symbol, limit=500)
-        if not trades:
-            return None, None, None, None
+        # Dynamically load the exchange class from ccxt
+        ex_class = getattr(ccxt, exchange_id)
+        ex = ex_class({'enableRateLimit': True, 'timeout': 10000})
+        
+        # Some exchanges use different naming for USDT pairs (e.g. BTC/USD)
+        # We try to fetch the trades for the provided symbol
+        trades = ex.fetch_trades(symbol, limit=200)
+        if not trades: return None
             
         df = pd.DataFrame(trades, columns=['side', 'amount', 'price'])
         df['amount'] = df['amount'].astype(float)
@@ -36,36 +36,49 @@ def track_order_flow(symbol):
         buys = df[df['side'] == 'buy']['amount'].sum()
         sells = df[df['side'] == 'sell']['amount'].sum()
         
-        total_vol = buys + sells
         delta = buys - sells
+        total_vol = buys + sells
         aggression = (delta / total_vol) if total_vol > 0 else 0
-        current_price = float(df['price'].iloc[-1])
+        price = float(df['price'].iloc[-1])
         
-        return aggression, current_price, buys, sells
+        return aggression, price
     except Exception as e:
-        print(f"Error on {symbol}: {e}")
-        return None, None, None, None
+        print(f"Skipping {exchange_id} for {symbol}: {e}")
+        return None
 
 def main():
-    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
+    print(f"Starting Multi-Exchange Scan...")
     
-    for s in symbols:
-        agg_ratio, price, buys, sells = track_order_flow(s)
+    for symbol in SYMBOLS:
+        results = []
+        for ex_id in EXCHANGE_LIST:
+            data = get_order_flow(ex_id, symbol)
+            if data:
+                agg, price = data
+                results.append({'ex': ex_id, 'agg': agg, 'price': price})
         
-        # Only alert if there is a significant move (>25% imbalance)
-        if agg_ratio is not None and abs(agg_ratio) > 0.25:
-            direction = "BULLISH FLOW 🟢" if agg_ratio > 0 else "BEARISH FLOW 🔴"
-            coin = s.split('/')[0]
+        if not results: continue
+
+        # Calculate an average 'Market Sentiment' across all available exchanges
+        avg_agg = sum(r['agg'] for r in results) / len(results)
+        avg_price = sum(r['price'] for r in results) / len(results)
+        coin = symbol.split('/')[0]
+
+        # Alert if the collective market aggression is high (>15%)
+        if abs(avg_agg) > 0.15:
+            status = "BULLISH FLOW 🟢" if avg_agg > 0 else "BEARISH FLOW 🔴"
+            ex_names = ", ".join([r['ex'].upper() for r in results])
             
             msg = (
-                f"📊 **${coin} ORDER FLOW**\n"
-                f"**{direction}**\n"
-                f"**Aggression:** {agg_ratio:.1%}\n"
-                f"**Price:** ${price:,.2f}"
+                f"🌎 **${coin} GLOBAL ORDER FLOW**\n"
+                f"**Status:** {status}\n"
+                f"**Avg Aggression:** {avg_agg:.1%}\n"
+                f"**Avg Price:** ${avg_price:,.2f}\n"
+                f"**Data From:** {ex_names}\n"
+                f"---"
             )
             send_discord(msg)
 
-    # CRITICAL: Force the script to exit so GitHub Actions stops the job
     print("Scan complete. Exiting...")
     sys.exit(0)
 
