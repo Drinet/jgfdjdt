@@ -1,14 +1,12 @@
-name: Trade Scanner
+name: OrderFlow Tracker
 on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
 jobs:
-  run-bot:
+  run-tracker:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -18,15 +16,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install ccxt pandas requests mplfinance pandas-ta
-      - name: Run Bot
+          pip install ccxt pandas requests
+      - name: Run Tracker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python bot.py
-      - name: Save Data
-        run: |
-          git config --global user.name "ScannerBot"
-          git config --global user.email "bot@trade.com"
-          git add trade_history.json
-          git commit -m "update trades [skip ci]" || exit 0
-          git push
