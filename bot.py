@@ -1,104 +1,73 @@
 import ccxt
 import pandas as pd
 import requests
-import time
 import os
+import sys
 
 # --- CONFIG ---
-# Replace with your actual webhook or use .env
-DISCORD_WEBHOOK = "YOUR_DISCORD_WEBHOOK_URL"
-COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
-# Percentage for SL and TPs based on your instructions
-SL_PCT = 0.02    # 2% drop
-TP1_PCT = 0.015  # 1.5% rise
-TP2_PCT = 0.03   # 3% rise
-TP3_PCT = 0.05   # 5% rise
+DISCORD_WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
 
-exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-
-class TradeTracker:
-    def __init__(self):
-        self.wins = 0
-        self.losses = 0
-
-    def get_stats(self):
-        total = self.wins + self.losses
-        wr = (self.wins / total * 100) if total > 0 else 0
-        return f"\n**Winrate:** {wr:.1f}% ({self.wins}W - {self.losses}L)"
-
-tracker = TradeTracker()
+# Initialize Exchange with a 10s timeout to prevent hanging
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'timeout': 10000, 
+    'options': {'defaultType': 'future'}
+})
 
 def send_discord(msg):
-    requests.post(DISCORD_WEBHOOK, json={"content": msg})
-
-def get_orderflow_metrics(symbol):
-    """
-    Analyzes the last 1000 trades to calculate Delta.
-    """
+    if not DISCORD_WEBHOOK:
+        return
     try:
-        trades = exchange.fetch_trades(symbol, limit=1000)
-        df = pd.DataFrame(trades, columns=['side', 'amount', 'price'])
-        
-        buys = df[df['side'] == 'buy']['amount'].astype(float).sum()
-        sells = df[df['side'] == 'sell']['amount'].astype(float).sum()
-        
-        delta = buys - sells
-        last_price = float(df['price'].iloc[-1])
-        
-        return delta, last_price
+        # Added timeout=10 so it doesn't hang forever if Discord is slow
+        requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
     except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-        return None, None
+        print(f"Discord Error: {e}")
 
-def analyze():
-    print(f"Scanning Order Flow at {time.strftime('%H:%M:%S')}...")
-    
-    for symbol in COINS:
-        delta, price = get_orderflow_metrics(symbol)
-        if delta is None: continue
-
-        coin_name = symbol.split('/')[0]
+def track_order_flow(symbol):
+    try:
+        # Fetch only the last 500 trades to keep it fast
+        trades = exchange.fetch_trades(symbol, limit=500)
+        if not trades:
+            return None, None, None, None
+            
+        df = pd.DataFrame(trades, columns=['side', 'amount', 'price'])
+        df['amount'] = df['amount'].astype(float)
         
-        # LOGIC: If Delta is strongly positive, aggressive buyers are in control
-        # This is a simplified 'Long trade' trigger
-        if delta > 50:  # Threshold depends on coin volume, 50 is just an example
-            entry = price
-            sl = entry * (1 - SL_PCT)
-            tp1 = entry * (1 + TP1_PCT)
-            tp2 = entry * (1 + TP2_PCT)
-            tp3 = entry * (1 + TP3_PCT)
-            
-            msg = (
-                f"🚀 **${coin_name}** | **COOL LONG TRADE DETECTED**\n"
-                f"Aggressive Buyers are stepping in! (Delta: +{delta:.2f})\n\n"
-                f"🔹 **Entry:** {entry:.4f}\n"
-                f"🎯 **TP1:** {tp1:.4f} (Win starts here & SL to Entry)\n"
-                f"🎯 **TP2:** {tp2:.4f}\n"
-                f"🎯 **TP3:** {tp3:.4f}\n"
-                f"🛑 **SL:** {sl:.4f}\n"
-                f"{tracker.get_stats()}"
-            )
-            send_discord(msg)
-            # For this example, we count a 'win' on signal to show the UI
-            tracker.wins += 1 
+        buys = df[df['side'] == 'buy']['amount'].sum()
+        sells = df[df['side'] == 'sell']['amount'].sum()
+        
+        total_vol = buys + sells
+        delta = buys - sells
+        aggression = (delta / total_vol) if total_vol > 0 else 0
+        current_price = float(df['price'].iloc[-1])
+        
+        return aggression, current_price, buys, sells
+    except Exception as e:
+        print(f"Error on {symbol}: {e}")
+        return None, None, None, None
 
-        elif delta < -50:
-            entry = price
-            sl = entry * (1 + SL_PCT)
-            tp1 = entry * (1 - TP1_PCT)
+def main():
+    symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
+    
+    for s in symbols:
+        agg_ratio, price, buys, sells = track_order_flow(s)
+        
+        # Only alert if there is a significant move (>25% imbalance)
+        if agg_ratio is not None and abs(agg_ratio) > 0.25:
+            direction = "BULLISH FLOW 🟢" if agg_ratio > 0 else "BEARISH FLOW 🔴"
+            coin = s.split('/')[0]
             
             msg = (
-                f"🔥 **${coin_name}** | **COOL SHORT TRADE DETECTED**\n"
-                f"Aggressive Sellers are hammering! (Delta: {delta:.2f})\n\n"
-                f"🔹 **Entry:** {entry:.4f}\n"
-                f"🎯 **TP1:** {tp1:.4f}\n"
-                f"🛑 **SL:** {sl:.4f}\n"
-                f"{tracker.get_stats()}"
+                f"📊 **${coin} ORDER FLOW**\n"
+                f"**{direction}**\n"
+                f"**Aggression:** {agg_ratio:.1%}\n"
+                f"**Price:** ${price:,.2f}"
             )
             send_discord(msg)
-            tracker.losses += 1
+
+    # CRITICAL: Force the script to exit so GitHub Actions stops the job
+    print("Scan complete. Exiting...")
+    sys.exit(0)
 
 if __name__ == "__main__":
-    while True:
-        analyze()
-        time.sleep(300) # Scan every 5 minutes
+    main()
